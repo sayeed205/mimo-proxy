@@ -25,6 +25,38 @@ deno run -A https://raw.githubusercontent.com/sayeed205/mimo-proxy/main/index.ts
 deno run --allow-net --allow-env --allow-read --allow-write index.ts
 ```
 
+> Deno caches remote modules. When running from the GitHub URL, add
+> `--reload=<url>` to pick up new pushes instead of the cached copy.
+
+## Run as a systemd user service
+
+`~/.config/systemd/user/mimo-proxy.service`:
+
+```ini
+[Unit]
+Description=MiMo Proxy (OpenAI-compatible proxy for MiMo Code free API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+Environment=PORT=4556
+# --reload=<url> refetches the latest push on every restart (deps stay cached)
+ExecStart=/usr/bin/deno run -A --reload=https://raw.githubusercontent.com/sayeed205/mimo-proxy/main/index.ts https://raw.githubusercontent.com/sayeed205/mimo-proxy/main/index.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mimo-proxy.service
+# after pushing changes, a restart pulls the new version:
+systemctl --user restart mimo-proxy.service
+```
+
 ## Endpoints
 
 - `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (streaming and non-streaming)
