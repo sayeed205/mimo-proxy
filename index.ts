@@ -15,7 +15,15 @@ const DEFAULT_PORT = 3000;
 const PROXY_API_KEY = Deno.env.get("PROXY_API_KEY");
 
 const DATA_DIR = `${Deno.env.get("HOME") ?? "."}/.mimo-proxy`;
-const FINGERPRINT_FILE = `${DATA_DIR}/client-fingerprint`;
+const FINGERPRINT_FILE = `${DATA_DIR}/client-fingerprint`; // legacy single-fp file (migrated)
+const POOL_FILE = `${DATA_DIR}/fingerprints.json`;
+
+// On 429 the proxy rotates to a different anonymous fingerprint to get a fresh
+// free-tier budget. Only helps if MiMo keys the limit on the fingerprint/identity
+// rather than the egress IP. Tunables:
+const MAX_FINGERPRINTS = Number(Deno.env.get("MAX_FINGERPRINTS") ?? 8);
+const FP_COOLDOWN_MS = Number(Deno.env.get("FP_COOLDOWN_MS") ?? 60 * 60_000); // assumed window reset
+const MAX_429_RETRIES = Number(Deno.env.get("MAX_429_RETRIES") ?? 3);
 
 interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -63,27 +71,80 @@ function base64UrlDecode(input: string): string {
 }
 
 // MiMo's free-tier bootstrap binds the issued JWT to a per-install
-// fingerprint. Persist it so we keep reusing the same identity across
-// restarts instead of looking like a new client every time.
-let fingerprintCache: string | undefined;
+// fingerprint. We keep a pool of fingerprints persisted to disk and rotate
+// between them on 429 so each one carries its own free-tier budget. A
+// rate-limited fingerprint is parked with a cooldown and reused once it
+// (presumably) resets.
+interface Fingerprint {
+  fp: string;
+  cooldownUntil: number; // epoch ms; <= now means available
+}
 
-async function getClientFingerprint(): Promise<string> {
-  if (fingerprintCache) return fingerprintCache;
-  try {
-    const existing = (await Deno.readTextFile(FINGERPRINT_FILE)).trim();
-    if (existing) {
-      fingerprintCache = existing;
-      return existing;
-    }
-  } catch {}
+let pool: Fingerprint[] | null = null;
+let activeIdx = 0;
+
+async function generateFingerprint(): Promise<string> {
   const seed = [Deno.build.os, Deno.build.arch, crypto.randomUUID()].join("|");
-  const fingerprint = await sha256Hex(seed);
-  fingerprintCache = fingerprint;
+  return await sha256Hex(seed);
+}
+
+async function savePool(): Promise<void> {
   try {
     await Deno.mkdir(DATA_DIR, { recursive: true });
-    await Deno.writeTextFile(FINGERPRINT_FILE, fingerprint);
+    await Deno.writeTextFile(POOL_FILE, JSON.stringify(pool));
   } catch {}
-  return fingerprint;
+}
+
+async function loadPool(): Promise<Fingerprint[]> {
+  if (pool) return pool;
+  // Existing pool file wins.
+  try {
+    const parsed = JSON.parse(await Deno.readTextFile(POOL_FILE));
+    if (Array.isArray(parsed) && parsed.length) {
+      pool = parsed as Fingerprint[];
+      return pool;
+    }
+  } catch {}
+  // Migrate the legacy single-fingerprint file if present.
+  let seedFp: string | undefined;
+  try {
+    const legacy = (await Deno.readTextFile(FINGERPRINT_FILE)).trim();
+    if (legacy) seedFp = legacy;
+  } catch {}
+  seedFp ??= await generateFingerprint();
+  pool = [{ fp: seedFp, cooldownUntil: 0 }];
+  await savePool();
+  return pool;
+}
+
+async function getClientFingerprint(): Promise<string> {
+  const p = await loadPool();
+  return p[activeIdx]?.fp ?? p[0].fp;
+}
+
+// Park the current fingerprint with a cooldown and switch to the best
+// alternative: the available one with the lowest cooldown, a freshly minted
+// one if the pool has room, else the entry that frees up soonest.
+async function rotateFingerprint(): Promise<string> {
+  const p = await loadPool();
+  const now = Date.now();
+  if (p[activeIdx]) p[activeIdx].cooldownUntil = now + FP_COOLDOWN_MS;
+
+  let pick = p.findIndex((f, i) => i !== activeIdx && f.cooldownUntil <= now);
+  if (pick === -1 && p.length < MAX_FINGERPRINTS) {
+    p.push({ fp: await generateFingerprint(), cooldownUntil: 0 });
+    pick = p.length - 1;
+  }
+  if (pick === -1) {
+    // All cooling down — take the one that recovers soonest.
+    pick = p.reduce(
+      (best, f, i) => (f.cooldownUntil < p[best].cooldownUntil ? i : best),
+      0,
+    );
+  }
+  activeIdx = pick;
+  await savePool();
+  return p[activeIdx].fp;
 }
 
 interface JwtState {
@@ -138,6 +199,14 @@ async function getJwt(forceRefresh = false): Promise<string> {
   } finally {
     bootstrapInflight = null;
   }
+}
+
+// Rotate to a different fingerprint and force a fresh JWT under that identity.
+async function rotateAndRefreshJwt(): Promise<string> {
+  await rotateFingerprint();
+  jwtCache = null;
+  bootstrapInflight = null;
+  return await getJwt(true);
 }
 
 // Derive a stable session id from the system + first user message so that
@@ -281,6 +350,14 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 
   if (mimoRes.status === 401 || mimoRes.status === 403) {
     jwt = await getJwt(true);
+    mimoRes = await callMimo(jwt, mimoBody, sessionId);
+  }
+
+  // Rate limited: park this fingerprint, rotate to a fresh identity, retry.
+  for (let attempt = 0; mimoRes.status === 429 && attempt < MAX_429_RETRIES; attempt++) {
+    await mimoRes.body?.cancel();
+    console.warn(`429 from upstream, rotating fingerprint (attempt ${attempt + 1}/${MAX_429_RETRIES})`);
+    jwt = await rotateAndRefreshJwt();
     mimoRes = await callMimo(jwt, mimoBody, sessionId);
   }
 

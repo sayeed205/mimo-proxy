@@ -37,12 +37,18 @@ one to be set) unless `PROXY_API_KEY` is configured.
 
 ## How it works
 
-1. Generates a per-install fingerprint, persisted to `~/.mimo-proxy/client-fingerprint`.
-2. Exchanges it for a short-lived JWT via `POST /api/free-ai/bootstrap`.
+1. Keeps a pool of anonymous fingerprints, persisted to `~/.mimo-proxy/fingerprints.json` (migrates the legacy `client-fingerprint` file).
+2. Exchanges the active fingerprint for a short-lived JWT via `POST /api/free-ai/bootstrap`.
 3. Forwards chat requests to `/api/free-ai/openai/chat` with that JWT, refreshing it ~5 min before expiry or on 401/403.
+4. On `429` (rate limit) parks the current fingerprint with a cooldown, rotates to another fingerprint (minting a fresh one if the pool has room), re-bootstraps, and retries — up to `MAX_429_RETRIES` times.
+
+> Rotation only resets the limit if MiMo keys the free tier on the fingerprint/identity. If it's keyed on your egress IP, you'll need a rotating egress (proxy pool) instead. Quick test: on a 429, `rm ~/.mimo-proxy/fingerprints.json`, restart — if it works again, rotation will help.
 
 ## Environment variables
 
 - `PORT` - listen port (default `3000`)
 - `PROXY_API_KEY` - if set, callers must send `Authorization: Bearer <PROXY_API_KEY>`
 - `MIMO_BASE_URL` - override the upstream base URL (default `https://api.xiaomimimo.com`)
+- `MAX_FINGERPRINTS` - max fingerprints kept in the rotation pool (default `8`)
+- `FP_COOLDOWN_MS` - how long a rate-limited fingerprint is parked before reuse (default `3600000`, 1h)
+- `MAX_429_RETRIES` - rotation+retry attempts per request on `429` (default `3`)
